@@ -92,6 +92,10 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn new() -> Self {
+        Builder::default().build().expect("build default client")
+    }
+
     pub fn connect(
         &self,
         addr: &SocketAddr,
