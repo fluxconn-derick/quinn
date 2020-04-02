@@ -1,12 +1,16 @@
-use std::collections::{hash_map, HashMap};
+use std::{
+    collections::{hash_map, HashMap},
+    mem,
+    ops::Range,
+};
 
 use bytes::Bytes;
 use err_derive::Error;
 use tracing::debug;
 
 use crate::{
-    assembler::Assembler, frame, range_set::RangeSet, transport_parameters::TransportParameters,
-    Dir, Side, StreamId, TransportError, VarInt,
+    assembler::Assembler, frame, frame::FrameStruct, range_set::RangeSet, send_buffer::SendBuffer,
+    transport_parameters::TransportParameters, Dir, Side, StreamId, TransportError, VarInt,
 };
 
 pub(crate) struct Streams {
@@ -27,6 +31,8 @@ pub(crate) struct Streams {
     /// This differs from `self.send.len()` in that it does not include streams that the peer is
     /// permitted to open but which have not yet been opened.
     send_streams: usize,
+    /// Streams with outgoing data queued
+    pending: Vec<StreamId>,
 }
 
 impl Streams {
@@ -40,6 +46,7 @@ impl Streams {
             next_remote: [0, 0],
             next_reported_remote: [0, 0],
             send_streams: 0,
+            pending: Vec::new(),
         };
 
         for dir in Dir::iter() {
@@ -221,36 +228,148 @@ impl Streams {
             assert!(self.recv.insert(id, Recv::new()).is_none());
         }
     }
+
+    /// Queue `data` to be written for `stream`
+    pub fn write(&mut self, id: StreamId, data: &[u8]) -> Result<usize, WriteError> {
+        let stream = self.send.get_mut(&id).ok_or(WriteError::UnknownStream)?;
+        let was_pending = stream.is_pending();
+        let len = match stream.write(data) {
+            Ok(n) => n,
+            e @ Err(WriteError::Stopped { .. }) => {
+                self.maybe_cleanup(id);
+                return e;
+            }
+            e @ Err(_) => return e,
+        };
+        if !was_pending && !data.is_empty() {
+            self.pending.push(id);
+        }
+        Ok(len)
+    }
+
+    /// Set the FIN bit in the next stream frame, generating an empty one if necessary
+    pub fn finish(&mut self, id: StreamId) -> Result<(), FinishError> {
+        let stream = self.send.get_mut(&id).ok_or(FinishError::UnknownStream)?;
+        if !stream.is_pending() {
+            self.pending.push(id);
+        }
+        stream.finish()?;
+        Ok(())
+    }
+
+    /// Abandon pending and future transmits
+    ///
+    /// Does not cause the actual RESET_STREAM frame to be sent, just updates internal
+    /// state.
+    pub fn reset(&mut self, id: StreamId, stop_reason: Option<VarInt>) -> Option<ResetStatus> {
+        let stream = self.send.get_mut(&id)?;
+        stream.reset(stop_reason)
+    }
+
+    pub fn can_send(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Get data to send on a stream frame, if any is available
+    pub fn poll_transmit(&mut self, max_frame_size: usize) -> Option<frame::StreamMeta> {
+        let max_data_len = max_frame_size.checked_sub(frame::Stream::SIZE_BOUND)?;
+        loop {
+            let id = self.pending.pop()?;
+            let stream = self.send.get_mut(&id).expect("missing pending stream");
+            match stream.state {
+                SendState::Ready | SendState::DataSent { .. } => {}
+                // Nothing more to send
+                SendState::ResetSent { .. }
+                | SendState::ResetRecvd { .. }
+                | SendState::DataRecvd => continue,
+            };
+            let fin = mem::replace(&mut stream.fin_pending, false);
+            let offsets = stream.pending.poll_transmit(max_data_len);
+            if stream.is_pending() {
+                self.pending.push(id);
+            }
+            // Would be nice to return a slice directly here as well so the caller doesn't have to
+            // call `pending_data` and redo the hash lookup, but borrowck objects.
+            return Some(frame::StreamMeta { id, offsets, fin });
+        }
+    }
+
+    /// Fetch data associated with a fresh `poll_transmit` result
+    pub fn pending_data(&self, id: StreamId, offsets: Range<u64>) -> &[u8] {
+        self.send.get(&id).unwrap().pending.get(offsets)
+    }
+
+    /// Returns whether the stream was finished
+    pub fn ack(&mut self, frame: frame::StreamMeta) -> bool {
+        let stream = match self.send.get_mut(&frame.id) {
+            // ACK for a closed stream is a noop
+            None => return false,
+            Some(x) => x,
+        };
+        let id = frame.id;
+        stream.ack(frame);
+        if stream.state == SendState::DataRecvd {
+            // Guaranteed to succeed on the send side
+            self.maybe_cleanup(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn retransmit(&mut self, frame: frame::StreamMeta) {
+        let stream = match self.send.get_mut(&frame.id) {
+            // Loss of data on a closed stream is a noop
+            None => return,
+            Some(x) => x,
+        };
+        if !stream.is_pending() {
+            self.pending.push(frame.id);
+        }
+        stream.fin_pending |= frame.fin;
+        stream.pending.retransmit(frame.offsets);
+    }
+
+    pub fn retransmit_all_for_0rtt(&mut self) {
+        for dir in Dir::iter() {
+            for index in 0..self.next[dir as usize] {
+                let id = StreamId::new(Side::Client, dir, index);
+                let stream = self.send.get_mut(&id).unwrap();
+                if stream.pending.in_flight() == 0 {
+                    // No data was sent on this stream
+                    continue;
+                }
+                if !stream.is_pending() {
+                    self.pending.push(id);
+                }
+                stream.pending.retransmit_all_for_0rtt();
+            }
+        }
+    }
+}
+
+/// Interesting states of a stream that's being reset
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ResetStatus {
+    WasFinishing,
+    WasBlocked,
 }
 
 #[derive(Debug)]
 pub(crate) struct Send {
-    pub offset: u64,
     pub max_data: u64,
     pub state: SendState,
-    /// Number of bytes sent but unacked
-    pub bytes_in_flight: u64,
+    pending: SendBuffer,
+    fin_pending: bool,
 }
 
 impl Send {
     pub fn new(max_data: u64) -> Self {
         Self {
-            offset: 0,
             max_data,
             state: SendState::Ready,
-            bytes_in_flight: 0,
-        }
-    }
-
-    pub fn write_budget(&mut self) -> Result<u64, WriteError> {
-        if let Some(error_code) = self.take_stop_reason() {
-            return Err(WriteError::Stopped(error_code));
-        }
-        let budget = self.max_data - self.offset;
-        if budget == 0 {
-            Err(WriteError::Blocked)
-        } else {
-            Ok(budget)
+            pending: SendBuffer::new(),
+            fin_pending: false,
         }
     }
 
@@ -263,11 +382,12 @@ impl Send {
         }
     }
 
-    pub fn finish(&mut self) -> Result<(), FinishError> {
+    fn finish(&mut self) -> Result<(), FinishError> {
         if self.state == SendState::Ready {
             self.state = SendState::DataSent {
                 finish_acked: false,
             };
+            self.fin_pending = true;
             Ok(())
         } else if let Some(error_code) = self.take_stop_reason() {
             Err(FinishError::Stopped(error_code))
@@ -286,6 +406,71 @@ impl Send {
             } => stop_reason.take(),
             _ => None,
         }
+    }
+
+    fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
+        if let Some(error_code) = self.take_stop_reason() {
+            return Err(WriteError::Stopped(error_code));
+        }
+        let budget = self.max_data - self.pending.offset();
+        if budget == 0 {
+            return Err(WriteError::Blocked);
+        }
+        let len = (data.len() as u64).min(budget) as usize;
+        self.pending.write(&data[0..len]);
+        Ok(len)
+    }
+
+    /// Returns whether the stream was finishing, indicating that the application needs to be
+    /// notified explicitly if the stream was stopped because no further write calls will be made.
+    fn reset(&mut self, stop_reason: Option<VarInt>) -> Option<ResetStatus> {
+        use SendState::*;
+        match self.state {
+            DataRecvd | ResetSent { .. } | ResetRecvd { .. } => None,
+            DataSent { .. } => {
+                self.state = ResetSent { stop_reason: None };
+                Some(ResetStatus::WasFinishing)
+            }
+            Ready => {
+                self.state = ResetSent { stop_reason };
+                if self.pending.offset() == self.max_data {
+                    Some(ResetStatus::WasBlocked)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn ack(&mut self, frame: frame::StreamMeta) {
+        self.pending.ack(frame.offsets);
+        if let SendState::DataSent {
+            ref mut finish_acked,
+        } = self.state
+        {
+            *finish_acked |= frame.fin;
+            if *finish_acked && self.pending.in_flight() == 0 {
+                self.state = SendState::DataRecvd;
+            }
+        }
+    }
+
+    /// Returns whether the stream was unblocked
+    pub fn max_data(&mut self, offset: u64) -> bool {
+        if offset <= self.max_data || self.state != SendState::Ready {
+            return false;
+        }
+        let was_blocked = self.pending.offset() == self.max_data;
+        self.max_data = offset;
+        was_blocked
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.pending.offset()
+    }
+
+    fn is_pending(&self) -> bool {
+        !self.pending.is_empty() || self.fin_pending
     }
 }
 
@@ -517,16 +702,6 @@ pub(crate) enum SendState {
     DataRecvd,
     /// Reset acknowledged
     ResetRecvd { stop_reason: Option<VarInt> },
-}
-
-impl SendState {
-    pub fn was_reset(self) -> bool {
-        use self::SendState::*;
-        match self {
-            ResetSent { .. } | ResetRecvd { .. } => true,
-            _ => false,
-        }
-    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]

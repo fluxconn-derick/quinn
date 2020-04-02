@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use err_derive::Error;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use tracing::{debug, error, info, trace, trace_span, warn};
@@ -497,28 +497,13 @@ where
             }
         }
 
-        for frame in info.retransmits.stream {
-            let ss = match self.streams.send_mut(frame.id) {
-                Some(x) => x,
-                None => continue,
-            };
-            ss.bytes_in_flight -= frame.data.len() as u64;
-            self.unacked_data -= frame.data.len() as u64;
-            if let streams::SendState::DataSent {
-                ref mut finish_acked,
-            } = ss.state
-            {
-                if frame.fin {
-                    *finish_acked = true;
-                }
-                if *finish_acked && ss.bytes_in_flight == 0 {
-                    ss.state = streams::SendState::DataRecvd;
-                    self.streams.maybe_cleanup(frame.id);
-                    self.events.push_back(Event::StreamFinished {
-                        stream: frame.id,
-                        stop_reason: None,
-                    });
-                }
+        for frame in info.stream {
+            let id = frame.id;
+            if self.streams.ack(frame) {
+                self.events.push_back(Event::StreamFinished {
+                    stream: id,
+                    stop_reason: None,
+                });
             }
         }
     }
@@ -686,12 +671,15 @@ where
             self.lost_packets += lost_packets.len() as u64;
             trace!("packets lost: {:?}", lost_packets);
             for packet in &lost_packets {
-                let info = self
+                let mut info = self
                     .space_mut(pn_space)
                     .sent_packets
                     .remove(&packet)
                     .unwrap(); // safe: lost_packets is populated just above
                 self.in_flight.remove(&info);
+                for frame in info.stream.drain(..) {
+                    self.streams.retransmit(frame);
+                }
                 self.space_mut(pn_space).pending += info.retransmits;
             }
             // Don't apply congestion penalty for lost ack-only packets
@@ -860,29 +848,6 @@ where
         self.timers.set(Timer::KeepAlive, now + interval);
     }
 
-    fn queue_stream_data(&mut self, stream: StreamId, data: Bytes) -> Result<(), WriteError> {
-        let ss = self
-            .streams
-            .send_mut(stream)
-            .ok_or(WriteError::UnknownStream)?;
-        assert_eq!(ss.state, streams::SendState::Ready);
-        let offset = ss.offset;
-        ss.offset += data.len() as u64;
-        ss.bytes_in_flight += data.len() as u64;
-        self.data_sent += data.len() as u64;
-        self.unacked_data += data.len() as u64;
-        self.space_mut(SpaceId::Data)
-            .pending
-            .stream
-            .push_back(frame::Stream {
-                offset,
-                fin: false,
-                data,
-                id: stream,
-            });
-        Ok(())
-    }
-
     /// Abandon transmitting data on a stream
     ///
     /// # Panics
@@ -898,38 +863,18 @@ where
             "only streams supporting outgoing data may be reset"
         );
 
-        // reset is a noop on a closed stream
-        let stream = match self.streams.send_mut(stream_id) {
-            Some(x) => x,
-            None => return,
-        };
         let stop_reason = if stopped { Some(error_code) } else { None };
-
-        use streams::SendState::*;
-        match stream.state {
-            DataRecvd | ResetSent { .. } | ResetRecvd { .. } => {
-                // Nothing to do
-                return;
-            }
-            DataSent { .. } => {
+        let status = self.streams.reset(stream_id, stop_reason);
+        let was_conn_blocked = self.blocked_streams.remove(&stream_id);
+        if stopped {
+            if status == Some(streams::ResetStatus::WasFinishing) {
                 self.events.push_back(Event::StreamFinished {
                     stream: stream_id,
                     stop_reason,
                 });
-                // No need to hold on to the stop_reason since it's propagated above
-                stream.state = ResetSent { stop_reason: None };
-            }
-            _ => {
-                // After we finish up here, we no longer care whether a reset stream was blocked.
-                let was_blocked = self.blocked_streams.remove(&stream_id);
-                // If this is an implicit reset due to `STOP_SENDING` and the caller might have a
-                // blocked write task, notify the caller to try writing again so they'll receive the
-                // `WriteError::Stopped` and the stream can be disposed of.
-                if stopped && (was_blocked || stream.offset == stream.max_data) {
-                    self.events
-                        .push_back(Event::StreamWritable { stream: stream_id });
-                }
-                stream.state = ResetSent { stop_reason };
+            } else if was_conn_blocked || status == Some(streams::ResetStatus::WasBlocked) {
+                self.events
+                    .push_back(Event::StreamWritable { stream: stream_id });
             }
         }
 
@@ -1412,6 +1357,7 @@ where
                             self.in_flight.remove(&info);
                             self.space_mut(SpaceId::Data).pending += info.retransmits;
                         }
+                        self.streams.retransmit_all_for_0rtt();
 
                         let token_len = packet.payload.len() - 16;
                         self.state = State::Handshake(state::Handshake {
@@ -1756,13 +1702,9 @@ where
                         ));
                     }
                     if let Some(ss) = self.streams.send_mut(id) {
-                        // We only care about budget *increases* for *live* streams
-                        if offset > ss.max_data && ss.state == streams::SendState::Ready {
-                            trace!(stream = %id, old = ss.max_data, new = offset, current_offset = ss.offset, "stream limit increased");
-                            if ss.offset == ss.max_data {
-                                self.events.push_back(Event::StreamWritable { stream: id });
-                            }
-                            ss.max_data = offset;
+                        if ss.max_data(offset) {
+                            // Unblocked
+                            self.events.push_back(Event::StreamWritable { stream: id });
                         }
                     } else if id.initiator() == self.side() && self.streams.is_local_unopened(id) {
                         debug!("got MAX_STREAM_DATA on unopened {}", id);
@@ -2317,7 +2259,7 @@ where
                 Some((exact_number, &crypto.packet)),
             );
 
-            if let Some((sent, acks)) = sent {
+            if let Some((sent, acks, stream)) = sent {
                 // If we sent any acks, don't immediately resend them. Setting this even if ack_only is
                 // false needlessly prevents us from ACKing the next packet if it's ACK-only, but saves
                 // the need for subtler logic to avoid double-transmitting acks all the time.
@@ -2337,6 +2279,7 @@ where
                         },
                         ack_eliciting,
                         retransmits: sent,
+                        stream,
                     },
                 );
             }
@@ -2364,9 +2307,14 @@ where
         })
     }
 
-    fn populate_packet(&mut self, space_id: SpaceId, buf: &mut Vec<u8>) -> (Retransmits, RangeSet) {
+    fn populate_packet(
+        &mut self,
+        space_id: SpaceId,
+        buf: &mut Vec<u8>,
+    ) -> (Retransmits, RangeSet, Vec<frame::StreamMeta>) {
         let space = &mut self.spaces[space_id as usize];
         let mut sent = Retransmits::default();
+        let mut stream = Vec::new();
         let zero_rtt_crypto = self.zero_rtt_crypto.as_ref();
         let tag_len = space
             .crypto
@@ -2477,7 +2425,7 @@ where
             frame::ResetStream {
                 id,
                 error_code,
-                final_offset: stream.offset,
+                final_offset: stream.offset(),
             }
             .encode(buf);
         }
@@ -2605,41 +2553,21 @@ where
         }
 
         // STREAM
-        while buf.len() + frame::Stream::SIZE_BOUND < max_size {
-            let mut stream = match space.pending.stream.pop_front() {
+        while buf.len() + frame::Stream::SIZE_BOUND < max_size && space_id == SpaceId::Data {
+            let meta = match self
+                .streams
+                .poll_transmit(max_size as usize - buf.len() - frame::Stream::SIZE_BOUND)
+            {
                 Some(x) => x,
                 None => break,
             };
-            if self
-                .streams
-                .send_mut(stream.id)
-                .map_or(true, |s| s.state.was_reset())
-            {
-                self.unacked_data -= stream.data.len() as u64;
-                continue;
-            }
-            let len = cmp::min(
-                stream.data.len(),
-                max_size as usize - buf.len() - frame::Stream::SIZE_BOUND,
-            );
-            let data = stream.data.split_to(len);
-            let fin = stream.fin && stream.data.is_empty();
-            trace!(id = %stream.id, off = stream.offset, len, fin, "STREAM");
-            let frame = frame::Stream {
-                id: stream.id,
-                offset: stream.offset,
-                fin,
-                data,
-            };
-            frame.encode(true, buf);
-            sent.stream.push_back(frame);
-            if !stream.data.is_empty() {
-                stream.offset += len as u64;
-                space.pending.stream.push_front(stream);
-            }
+            trace!(id = %meta.id, off = meta.offsets.start, len = meta.offsets.end - meta.offsets.start, fin = meta.fin, "STREAM");
+            meta.encode(true, buf);
+            buf.put_slice(self.streams.pending_data(meta.id, meta.offsets.clone()));
+            stream.push(meta);
         }
 
-        (sent, acks)
+        (sent, acks, stream)
     }
 
     /// Close a connection immediately
@@ -2768,12 +2696,7 @@ where
     ///
     /// If this fails, no [`Event::StreamFinished`] will be generated.
     pub fn finish(&mut self, id: StreamId) -> Result<(), FinishError> {
-        let ss = self
-            .streams
-            .send_mut(id)
-            .ok_or(FinishError::UnknownStream)?;
-        ss.finish()?;
-        self.spaces[SpaceId::Data as usize].finish_stream(id, ss.offset);
+        self.streams.finish(id)?;
         // We no longer need to notify the application of capacity for additional writes.
         self.blocked_streams.remove(&id);
         Ok(())
@@ -2946,31 +2869,14 @@ where
             return Err(WriteError::Blocked);
         }
 
-        let budget_res = self
-            .streams
-            .send_mut(stream)
-            .ok_or(WriteError::UnknownStream)?
-            .write_budget();
-
-        let stream_budget = match budget_res {
-            Ok(budget) => budget,
-            Err(e @ WriteError::Stopped { .. }) => {
-                self.streams.maybe_cleanup(stream);
-                return Err(e);
-            }
-            Err(e @ WriteError::Blocked) => {
-                trace!(%stream, "write blocked by flow control");
-                return Err(e);
-            }
-            Err(WriteError::UnknownStream) => unreachable!("not returned here"),
-        };
-
-        let conn_budget = cmp::min(
-            self.max_data - self.data_sent,
-            self.config.send_window - self.unacked_data,
-        );
-        let n = conn_budget.min(stream_budget).min(data.len() as u64) as usize;
-        self.queue_stream_data(stream, Bytes::copy_from_slice(&data[0..n]))?;
+        // TODO: Send window in terms of actual buffer size, which includes discontinuously acked
+        // data
+        let len = (data.len() as u64)
+            .min(self.max_data - self.data_sent)
+            .min(self.config.send_window - self.unacked_data) as usize;
+        let n = self.streams.write(stream, &data[0..len])?;
+        self.data_sent += n as u64;
+        self.unacked_data += n as u64;
         trace!(%stream, "wrote {} bytes", n);
         Ok(n)
     }
@@ -3143,11 +3049,12 @@ where
         &mut self.spaces[id as usize]
     }
 
-    /// Whether we have non-retransmittable 1-RTT data to send
+    /// Whether we have 1-RTT data to send
     ///
     /// See also `self.space(SpaceId::Data).can_send()`
     fn can_send_1rtt(&self) -> bool {
-        self.path_challenge_pending
+        self.streams.can_send()
+            || self.path_challenge_pending
             || self.path_response.is_some()
             || !self.datagrams.outgoing.is_empty()
     }
